@@ -19,7 +19,7 @@ class LayerNorm(nn.Module):
     def __init__(self, ndim, bias):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Paranetere(torch.zeros(ndim)) if bias else None
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, x):
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, eps=1e-5)
@@ -81,7 +81,7 @@ class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed, bias=config.bias)
-        self.gelu = F.gelu()
+        self.gelu = F.gelu
         self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -133,7 +133,7 @@ class GPT(nn.Module):
         # apply special scaled initialization to the residual paths
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layers))
 
         print("number of parameters: %.2fM" %  (self.get_num_params()/1e6,))
 
@@ -190,12 +190,17 @@ class GPT(nn.Module):
 
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        pos = torch.arange(0, t, dtype=torch)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         tok_emb = self.transformer.wte(idx) #b, t, n_embed)
         pos_emb = self.transformer.wpe(pos) #b, t, n_embed)
 
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        for block in self.transformer.h:
+            x = block(x)
+
+        x = self.transformer.ln_f(x)
 
         if targets is not None:
             # train
