@@ -5,6 +5,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from dataclasses import dataclass
+
+@dataclass
+class GPTConfigSmall:
+    vocab_size: int = 50272
+    block_size: int = 256
+    n_embed: int = 384
+    n_heads: int = 6
+    n_layers: int = 6
+    dropout: float = 0.25
+    n_hidden: int = 1536
+    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+
+@dataclass
 class GPTConfig:
     vocab_size: int = 50257
     block_size: int = 1024
@@ -12,6 +27,7 @@ class GPTConfig:
     n_heads: int = 12
     n_layers: int = 12
     dropout: float = 0.1
+    n_hidden: int = 4 * 768
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class LayerNorm(nn.Module):
@@ -80,9 +96,9 @@ class MLP(nn.Module):
 
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed, bias=config.bias)
+        self.c_fc = nn.Linear(config.n_embed, config.n_hidden, bias=config.bias)
         self.gelu = F.gelu
-        self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_hidden, config.n_embed, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -235,3 +251,97 @@ class GPT(nn.Module):
             idx = torch.cat((idx,idx_next), dim=1) # B, t+1 
 
         return idx
+
+    def crop_block_size(self, block_size: int):
+        """Reduce the block size (context length) of the model, if needed."""
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+
+    @classmethod
+    def from_pretrained(cls, model_type: str, override_args=None):
+        """
+        Load weights from a pretrained Hugging Face GPT-2 model into this GPT implementation.
+        `override_args` currently only supports overriding dropout.
+        """
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        override_args = override_args or {}
+        # only dropout can be overridden (to keep usage simple)
+        assert all(k == 'dropout' for k in override_args)
+
+        from transformers import GPT2LMHeadModel
+
+        print(f"loading weights from pretrained gpt: {model_type}")
+
+        # Map model_type to our config fields (using our naming: n_layers, n_heads, n_embed)
+        config_args = {
+            'gpt2':         dict(n_layers=12, n_heads=12, n_embed=768),   # 124M params
+            'gpt2-medium':  dict(n_layers=24, n_heads=16, n_embed=1024), # 350M params
+            'gpt2-large':   dict(n_layers=36, n_heads=20, n_embed=1280), # 774M params
+            'gpt2-xl':      dict(n_layers=48, n_heads=25, n_embed=1600), # 1558M params
+        }[model_type]
+
+        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50257
+        config_args['block_size'] = 1024
+        config_args['bias'] = True
+
+        if 'dropout' in override_args:
+            print(f"overriding dropout rate to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
+
+        # create a from-scratch initialized model with this configuration
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = [k for k in sd.keys() if not k.endswith('.attn.bias')]
+
+        # init a huggingface/transformers GPT-2 model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        sd_keys_hf = [k for k in sd_hf.keys()
+                      if not k.endswith('.attn.masked_bias')
+                      and not k.endswith('.attn.bias')]
+
+        # Conv1D vs Linear weight layout differences
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight',
+                      'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+
+    def estimate_mfu(self, fwdbwd_per_iter: int, dt: float):
+        """
+        Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS.
+        Follows the PaLM paper Appendix B.
+        """
+        N = self.get_num_params()
+        cfg = self.config
+        L = cfg.n_layers
+        H = cfg.n_heads
+        Q = cfg.n_embed // cfg.n_heads
+        T = cfg.block_size
+
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+
+        flops_achieved = flops_per_iter * (1.0 / dt)
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
+        return mfu
