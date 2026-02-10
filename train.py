@@ -1,4 +1,5 @@
 import os
+os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 import time
 import math
 import pickle
@@ -7,7 +8,6 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 import tiktoken
 
@@ -20,6 +20,7 @@ eval_interval = 250
 ddp = int(os.environ.get("RANK", -1)) != -1
 
 if ddp:
+    from torch.distributed import init_process_group, destroy_process_group
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ.get(['RANK']))
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -53,8 +54,10 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 total_batch_size = 524277 # 2**19, ~0.5M, in number of tokens
 
-B = 64
-T = 1024
+B = 1
+T = 64
+
+print(f"B: {B}, T: {T}, ddp_world_size: {ddp_world_size}, total_batch_size: {total_batch_size}")
 
 assert total_batch_size % (B*T*ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 
@@ -70,7 +73,7 @@ val_loader = None
 
 torch.set_float32_matmul_precision('high')
 
-model = GPT(GPTConfig(block_size=50304))
+model = GPT(GPTConfig())
 
 model.to(device)
 
@@ -120,7 +123,7 @@ for step in range(max_steps):
 
     if step % eval_interval == 0 or last_step:
         #TODO: evaluate
-        print(f"step {step} of {max_steps} took {time.time() - to:.2f}s")
+        print(f"step {step} of {max_steps} took {time.time() - t0:.2f}s")
 
     # Train for one step
 

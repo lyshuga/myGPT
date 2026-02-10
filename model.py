@@ -67,26 +67,33 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
 
-        B, T, C = x.size() #batch size, sequence length, embedding dimensionality (n_embed)
+        B, T, C = x.size() # x: (B, T, C) = (batch_size, seq_len, n_embed)
 
+        # self.c_attn(x): (B, T, 3*C) -> q, k, v: (B, T, C) each
         q, k, v = self.c_attn(x).split(self.n_embed, dim=2)
 
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        # reshape last dim C into (n_head, head_dim) and move head dim before time:
+        # (B, T, C) -> view: (B, T, n_head, head_dim) -> transpose: (B, n_head, T, head_dim)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # k: (B, H, T, D)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # q: (B, H, T, D)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # v: (B, H, T, D)
 
         if self.flash:
+            # scaled_dot_product_attention keeps shape: (B, H, T, D)
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+            # k.transpose(-2, -1): (B, H, T, D) -> (B, H, D, T)
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))      # att: (B, H, T, T)
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))  # (B, H, T, T)
+            att = F.softmax(att, dim=-1)                                 # (B, H, T, T)
+            att = self.attn_dropout(att)                                 # (B, H, T, T)
+            y = att @ v  # (B, H, T, T) @ (B, H, T, D) -> (B, H, T, D)
         
+        # y: (B, H, T, D) -> transpose: (B, T, H, D) -> view: (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        y = self.resid_dropout(self.c_proj(y))
+        # self.c_proj: (B, T, C) -> (B, T, C), dropout keeps shape
+        y = self.resid_dropout(self.c_proj(y))  # y: (B, T, C)
 
         return y
 
@@ -236,7 +243,7 @@ class GPT(nn.Module):
         for _ in range(max_new_tokens):
             # if sequence context is too long we crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits,_ = self(idx_cond)
+            logits, _ = self(idx_cond)
 
             logits = logits[:, -1, :] / temperature
 
